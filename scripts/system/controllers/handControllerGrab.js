@@ -1036,8 +1036,8 @@ function getControllerJointIndex(hand) {
                                       "_CONTROLLER_RIGHTHAND" :
                                       "_CONTROLLER_LEFTHAND");
     }
-    
-    return MyAvatar.getJointIndex("Head");    
+
+    return MyAvatar.getJointIndex("Head");
 }
 
 // global EquipHotspotBuddy instance
@@ -1092,6 +1092,7 @@ function MyController(hand) {
     this.grabbedOverlay = null;
     this.state = STATE_OFF;
     this.pointer = null; // entity-id of line object
+    this.grabbedThingIsTempDynamic = false;
 
     this.triggerValue = 0; // rolling average of trigger value
     this.triggerClicked = false;
@@ -1331,7 +1332,7 @@ function MyController(hand) {
         if (this.stylus) {
             return;
         }
-        
+
         var stylusProperties = {
             name: "stylus",
             url: Script.resourcesPath() + "meshes/tablet-stylus-fat.fbx",
@@ -2132,7 +2133,7 @@ function MyController(hand) {
             return null;
         }
     };
-        
+
     this.chooseNearEquipHotspotsForFarToNearEquip = function(candidateEntities, distance) {
         var equippableHotspots = flatten(candidateEntities.map(function(entityID) {
                 return _this.collectEquipHotspots(entityID);
@@ -2289,7 +2290,7 @@ function MyController(hand) {
                 return;
             }
         }
-        
+
         if (isInEditMode()) {
             this.searchIndicatorOn(rayPickInfo.searchRay);
             if (this.triggerSmoothedGrab()) {
@@ -2314,7 +2315,20 @@ function MyController(hand) {
 
         if (rayPickInfo.entityID) {
             entity = rayPickInfo.entityID;
-            name = entityPropertiesCache.getProps(entity).name;
+            var props = entityPropertiesCache.getProps(entity);
+            name = props.name;
+            var isGrabbable = entityPropertiesCache.getGrabbableProps(entity).grabbable;
+            var isDynamic = props.dynamic;
+            var makeTempDynamic = isGrabbable && !isDynamic;
+
+            if(makeTempDynamic) {
+                this.grabbedThingIsTempDynamic = true;
+                Entities.editEntity(entity,{
+                    dynamic: true
+                });
+                entityPropertiesCache._updateCacheEntry(entity);
+            }
+
             if (this.entityWantsTrigger(entity)) {
                 if (this.triggerSmoothedGrab()) {
                     this.grabbedThingID = entity;
@@ -2352,6 +2366,14 @@ function MyController(hand) {
                     this.otherGrabbingLineOn(startPosition, finishPisition, COLORS_GRAB_DISTANCE_HOLD);
                 } else {
                     this.otherGrabbingLineOff();
+                }
+
+                if(makeTempDynamic) {
+                    this.grabbedThingIsTempDynamic = false;
+                    Entities.editEntity(entity, {
+                        dynamic: false
+                    });
+                    entityPropertiesCache._updateCacheEntry(entity);
                 }
             } else {
                 this.otherGrabbingLineOff();
@@ -3440,14 +3462,14 @@ function MyController(hand) {
     };
 
     this.offEnter = function() {
-        // Reuse the existing search distance if lasers were active since 
+        // Reuse the existing search distance if lasers were active since
         // they will be shown in OFF state while in edit mode.
         var existingSearchDistance = this.searchSphereDistance;
         this.release();
-        
+
         if (isInEditMode()) {
             this.searchSphereDistance = existingSearchDistance;
-        }        
+        }
     };
 
     this.entityLaserTouchingEnter = function() {
@@ -3769,6 +3791,16 @@ function MyController(hand) {
 
             // Make a small release haptic pulse if we really were holding something
             Controller.triggerHapticPulse(HAPTIC_PULSE_STRENGTH, HAPTIC_PULSE_DURATION, this.hand);
+
+            if(this.grabbedThingIsTempDynamic) {
+                this.grabbedThingIsTempDynamic = false;
+                Entities.editEntity(this.grabbedThingID, {
+                    dynamic: false,
+                    velocity: {x:0, y:0, z:0},
+                    angularVelocity: {x:0, y:0, z:0}
+                });
+            }
+
             if (this.actionID !== null) {
                 Entities.deleteAction(this.grabbedThingID, this.actionID);
             } else {

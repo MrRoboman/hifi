@@ -1055,6 +1055,7 @@ SelectionDisplay = (function() {
     that.TRIGGER_ON_VALUE = 0.4;
     that.TRIGGER_OFF_VALUE = 0.15;
     that.triggered = false;
+    that.gripped = false;
     var activeHand = Controller.Standard.RightHand;
     function makeTriggerHandler(hand) {
         return function (value) {
@@ -1075,8 +1076,30 @@ SelectionDisplay = (function() {
             }
         };
     }
+    function makeGripHandler(hand) {
+        return function (value) {
+            if (!that.gripped && value === 1) {
+                that.gripped = true;
+                if (activeHand !== hand) {
+                    activeHand = (activeHand === Controller.Standard.RightHand) ?
+                        Controller.Standard.LeftHand : Controller.Standard.RightHand;
+                }
+                var object = SelectionManager.selections[0];
+                if (object) {
+                    activeTool = nearGrabTranslateTool;
+                    mode = nearGrabTranslateTool.mode;
+                    activeTool.onBegin();
+                }
+            } else if (that.gripped && value === 0) {
+                that.gripped = false;
+                activeTool.onEnd();
+            }
+        };
+    }
     that.triggerMapping.from(Controller.Standard.RT).peek().to(makeTriggerHandler(Controller.Standard.RightHand));
     that.triggerMapping.from(Controller.Standard.LT).peek().to(makeTriggerHandler(Controller.Standard.LeftHand));
+    that.triggerMapping.from(Controller.Standard.RightGrip).peek().to(makeGripHandler(Controller.Standard.RightHand));
+    that.triggerMapping.from(Controller.Standard.LeftGrip).peek().to(makeGripHandler(Controller.Standard.LeftHand));
 
 
     function controllerComputePickRay() {
@@ -2539,6 +2562,115 @@ SelectionDisplay = (function() {
         }
     };
 
+
+    var MIN_FAR_GRAB_DISTANCE = 0.3;
+    var FAR_GRAB_PUSH_FACTOR = 15;
+
+    var farGrabTranslateTool = {
+        mode: 'FAR_GRAB_TRANSLATE',
+        previousAvatarPosition: {x:0, y:0, z:0},
+        previousDistance: 0.0,
+        onBegin: function(event) {
+            SelectionManager.saveProperties();
+            var controllerPosition = controllerComputePickRay().origin;
+            var objectPosition = SelectionManager.worldPosition;
+            this.previousDistance = Vec3.distance(controllerPosition, objectPosition);
+            this.previousAvatarPosition = MyAvatar.position;
+        },
+        onEnd: function(event, reason) {
+
+        },
+        onMove: function(event) {
+            var controllerOriginAndDirection = controllerComputePickRay();
+            var controllerPosition = controllerOriginAndDirection.origin;
+            var controllerDirection = controllerOriginAndDirection.direction;
+            var objectPosition = SelectionManager.worldPosition;
+
+            var deltaAvatarPosition = Vec3.distance(MyAvatar.position, this.previousAvatarPosition);
+            this.previousAvatarPosition = MyAvatar.position;
+
+            var newDistance;
+            if (deltaAvatarPosition < 0.001) { // only allow pushing and pulling if the avatar is not moving
+                newDistance = Vec3.distance(controllerPosition, objectPosition);
+                newDistance = this.previousDistance + (this.previousDistance - newDistance) * FAR_GRAB_PUSH_FACTOR;
+                if (newDistance < MIN_FAR_GRAB_DISTANCE) {
+                    newDistance = MIN_FAR_GRAB_DISTANCE;
+                }
+                this.previousDistance = newDistance;
+            }
+            else {
+                newDistance = this.previousDistance;
+            }
+
+            var newPosition = Vec3.sum(controllerPosition, Vec3.multiply(controllerDirection, newDistance));
+
+            Entities.editEntity(SelectionManager.selections[0], {
+                position: newPosition
+            });
+
+            SelectionManager._update();
+        }
+    };
+
+    var nearGrabTranslateTool = {
+        mode: 'NEAR_GRAB_TRANSLATE',
+        selectedEntity: null,
+        onBegin: function(event) {
+            SelectionManager.saveProperties();
+            this.selectedEntity = SelectionManager.selections[0];
+
+            if (this.selectedEntity) {
+                var props = Entities.getEntityProperties(this.selectedEntity, ["position", "rotation", "dimensions"]);
+                var palmRotation;
+                var palmPosition;
+                var hand;
+
+                if (activeHand === Controller.Standard.RightHand) {
+                    palmRotation = MyAvatar.getRightPalmRotation();
+                    palmPosition = MyAvatar.getRightPalmPosition();
+                    hand = "right";
+                }
+                else {
+                    palmRotation = MyAvatar.getLeftPalmRotation();
+                    palmPosition = MyAvatar.getLeftPalmPosition();
+                    hand = "left";
+                }
+
+                var offsetRotation = Quat.multiply(Quat.inverse(palmRotation), props.rotation);
+                var offset = Vec3.subtract(props.position, palmPosition);
+                var offsetPosition = Vec3.multiplyQbyV(Quat.inverse(Quat.multiply(palmRotation, offsetRotation)), offset);
+
+                if(this.actionID) {
+                    Entities.deleteAction(this.selectedEntity, this.actionID);
+                }
+                this.actionID = Entities.addAction("hold", this.selectedEntity, {
+                    hand: hand,
+                    timeScale: 0.05,
+                    relativePosition: offsetPosition,
+                    relativeRotation: offsetRotation,
+                    ttl: 15,
+                    kinematic: true,
+                    kinematicSetVelocity: true,
+                    ignoreIK: false
+                });
+
+                that.setOverlaysVisible(false);
+            }
+        },
+        onEnd: function(event, reason) {
+            Entities.deleteAction(this.selectedEntity, this.actionID);
+            Entities.editEntity(this.selectedEntity, {
+                velocity: {x:0, y:0, z:0},
+                angularVelocity: {x:0, y:0, z:0}
+            });
+            this.selectedEntity = null;
+            SelectionManager._update();
+        },
+        onMove: function(event) {
+
+        }
+    };
+
     var lastXYPick = null
     var upDownPickNormal = null;
     addGrabberTool(grabberMoveUp, {
@@ -2654,15 +2786,14 @@ SelectionDisplay = (function() {
     // offset - the position of the overlay tool relative to the selections center position
     var makeStretchTool = function(stretchMode, direction, pivot, offset, customOnMove) {
         //  directionFor3DStretch - direction and pivot for 3D stretch
-        //  distanceFor3DStretch - distance from the intersection point and the handController 
+        //  distanceFor3DStretch - distance from the intersection point and the handController
         //     used to increase the scale taking into account the distance to the object
-        //    DISTANCE_INFLUENCE_THRESHOLD - constant that holds the minimum distance where the 
+        //    DISTANCE_INFLUENCE_THRESHOLD - constant that holds the minimum distance where the
         //     distance to the object will influence the stretch/resize/scale
         var directionFor3DStretch = getDirectionsFor3DStretch(stretchMode);
         var distanceFor3DStretch = 0;
         var DISTANCE_INFLUENCE_THRESHOLD = 1.2;
-        
-        
+
         var signs = {
             x: direction.x < 0 ? -1 : (direction.x > 0 ? 1 : 0),
             y: direction.y < 0 ? -1 : (direction.y > 0 ? 1 : 0),
@@ -2674,8 +2805,6 @@ SelectionDisplay = (function() {
             y: Math.abs(direction.y) > 0 ? 1 : 0,
             z: Math.abs(direction.z) > 0 ? 1 : 0,
         };
-        
-        
 
         var numDimensions = mask.x + mask.y + mask.z;
 
@@ -2728,18 +2857,18 @@ SelectionDisplay = (function() {
 
             // Scaled offset in world coordinates
             var scaledOffsetWorld = vec3Mult(initialDimensions, offsetRP);
-            
+
             pickRayPosition = Vec3.sum(initialPosition, Vec3.multiplyQbyV(rotation, scaledOffsetWorld));
-            
+
             if (directionFor3DStretch) {
                 // pivot, offset and pickPlanePosition for 3D manipulation
                 var scaledPivot3D = Vec3.multiply(0.5, Vec3.multiply(1.0, directionFor3DStretch));
                 deltaPivot3D = Vec3.subtract(centeredRP, scaledPivot3D);
-                
-                var scaledOffsetWorld3D = vec3Mult(initialDimensions, 
-                    Vec3.subtract(Vec3.multiply(0.5, Vec3.multiply(-1.0, directionFor3DStretch)), 
+
+                var scaledOffsetWorld3D = vec3Mult(initialDimensions,
+                    Vec3.subtract(Vec3.multiply(0.5, Vec3.multiply(-1.0, directionFor3DStretch)),
                     centeredRP));
-                
+
                 pickRayPosition3D = Vec3.sum(initialPosition, Vec3.multiplyQbyV(rotation, scaledOffsetWorld));
             }
             var start = null;
@@ -2842,13 +2971,13 @@ SelectionDisplay = (function() {
                     };
                 }
             }
-            
+
             planeNormal = Vec3.multiplyQbyV(rotation, planeNormal);
             var pickRay = generalComputePickRay(event.x, event.y);
             lastPick = rayPlaneIntersection(pickRay,
                 pickRayPosition,
                 planeNormal);
-                
+
             var planeNormal3D = {
                 x: 0,
                 y: 0,
@@ -2860,7 +2989,7 @@ SelectionDisplay = (function() {
                     planeNormal3D);
                 distanceFor3DStretch = Vec3.length(Vec3.subtract(pickRayPosition3D, pickRay.origin));
             }
-        
+
             SelectionManager.saveProperties();
         };
 
@@ -2891,31 +3020,31 @@ SelectionDisplay = (function() {
                 dimensions = SelectionManager.worldDimensions;
                 rotation = SelectionManager.worldRotation;
             }
-            
+
             var localDeltaPivot = deltaPivot;
             var localSigns = signs;
 
             var pickRay = generalComputePickRay(event.x, event.y);
-            
+
             // Are we using handControllers or Mouse - only relevant for 3D tools
             var controllerPose = getControllerWorldLocation(activeHand, true);
-            if (HMD.isHMDAvailable() 
+            if (HMD.isHMDAvailable()
                 && HMD.isHandControllerAvailable() && controllerPose.valid && that.triggered && directionFor3DStretch) {
                 localDeltaPivot = deltaPivot3D;
 
                 newPick = pickRay.origin;
-            
+
                 var vector = Vec3.subtract(newPick, lastPick3D);
-                
+
                 vector = Vec3.multiplyQbyV(Quat.inverse(rotation), vector);
-            
+
                 if (distanceFor3DStretch > DISTANCE_INFLUENCE_THRESHOLD) {
                     // Range of Motion
                     vector = Vec3.multiply(distanceFor3DStretch , vector);
                 }
-                
+
                 localSigns = directionFor3DStretch;
-                
+
             } else {
                 newPick = rayPlaneIntersection(pickRay,
                 pickRayPosition,
@@ -2925,9 +3054,9 @@ SelectionDisplay = (function() {
                 vector = Vec3.multiplyQbyV(Quat.inverse(rotation), vector);
 
                 vector = vec3Mult(mask, vector);
-                
+
             }
-            
+
             if (customOnMove) {
                 var change = Vec3.multiply(-1, vec3Mult(localSigns, vector));
                 customOnMove(vector, change);
@@ -2957,8 +3086,8 @@ SelectionDisplay = (function() {
                     newDimensions = Vec3.sum(initialDimensions, changeInDimensions);
                 }
             }
-        
-        
+
+
             newDimensions.x = Math.max(newDimensions.x, MINIMUM_DIMENSION);
             newDimensions.y = Math.max(newDimensions.y, MINIMUM_DIMENSION);
             newDimensions.z = Math.max(newDimensions.z, MINIMUM_DIMENSION);
@@ -2972,7 +3101,7 @@ SelectionDisplay = (function() {
                     dimensions: newDimensions,
                 });
             }
-            
+
 
             var wantDebug = false;
             if (wantDebug) {
@@ -2999,7 +3128,7 @@ SelectionDisplay = (function() {
             onEnd: onEnd
         };
     };
-    
+
     // Direction for the stretch tool when using hand controller
     var directionsFor3DGrab = {
         LBN: {
@@ -3043,7 +3172,7 @@ SelectionDisplay = (function() {
             z: -1
         }
     };
-    
+
     // Returns a vector with directions for the stretch tool in 3D using hand controllers
     function getDirectionsFor3DStretch(mode) {
         if (mode === "STRETCH_LBN") {
@@ -3066,8 +3195,8 @@ SelectionDisplay = (function() {
             return null;
         }
     }
-    
-    
+
+
 
     function addStretchTool(overlay, mode, pivot, direction, offset, handleMove) {
         if (!pivot) {
@@ -4060,6 +4189,7 @@ SelectionDisplay = (function() {
 
     that.mousePressEvent = function(event) {
         var wantDebug = false;
+
         if (!event.isLeftButton && !that.triggered) {
             // if another mouse button than left is pressed ignore it
             return false;
@@ -4409,21 +4539,29 @@ SelectionDisplay = (function() {
             if (result.intersects) {
                 switch (result.overlayID) {
                     case selectionBox:
-                        activeTool = translateXZTool;
-                        translateXZTool.pickPlanePosition = result.intersection;
-                        translateXZTool.greatestDimension = Math.max(Math.max(SelectionManager.worldDimensions.x, SelectionManager.worldDimensions.y),
+                        if (event.isLeftButton) {
+                            activeTool = translateXZTool;
+                            translateXZTool.pickPlanePosition = result.intersection;
+                            translateXZTool.greatestDimension = Math.max(Math.max(SelectionManager.worldDimensions.x, SelectionManager.worldDimensions.y),
                             SelectionManager.worldDimensions.z);
-                        if (wantDebug) {
-                            print("longest dimension: " + translateXZTool.greatestDimension);
-                            translateXZTool.startingDistance = Vec3.distance(pickRay.origin, SelectionManager.position);
-                            print("starting distance: " + translateXZTool.startingDistance);
-                            translateXZTool.startingElevation = translateXZTool.elevation(pickRay.origin, translateXZTool.pickPlanePosition);
-                            print(" starting elevation: " + translateXZTool.startingElevation);
-                        }
+                            if (wantDebug) {
+                                print("longest dimension: " + translateXZTool.greatestDimension);
+                                translateXZTool.startingDistance = Vec3.distance(pickRay.origin, SelectionManager.position);
+                                print("starting distance: " + translateXZTool.startingDistance);
+                                translateXZTool.startingElevation = translateXZTool.elevation(pickRay.origin, translateXZTool.pickPlanePosition);
+                                print(" starting elevation: " + translateXZTool.startingElevation);
+                            }
 
-                        mode = translateXZTool.mode;
-                        activeTool.onBegin(event);
-                        somethingClicked = 'selectionBox';
+                            mode = translateXZTool.mode;
+                            activeTool.onBegin(event);
+                            somethingClicked = 'selectionBox';
+                        }
+                        else if (that.triggered) { // far grabbing with hand controller
+                            activeTool = farGrabTranslateTool;
+                            mode = farGrabTranslateTool.mode;
+                            activeTool.onBegin();
+                            somethingClicked = null;
+                        }
                         break;
                     default:
                         if (wantDebug) {
@@ -4547,7 +4685,7 @@ SelectionDisplay = (function() {
                     pickedAlpha = grabberAlpha;
                     highlightNeeded = true;
                     break;
-                    
+
                 default:
                     if (previousHandle) {
                         Overlays.editOverlay(previousHandle, {

@@ -2564,7 +2564,7 @@ SelectionDisplay = (function() {
 
 
     var MIN_FAR_GRAB_DISTANCE = 0.3;
-    var FAR_GRAB_PUSH_FACTOR = 15;
+    var FAR_GRAB_PUSH_FACTOR = 60;
 
     var farGrabTranslateTool = {
         mode: 'FAR_GRAB_TRANSLATE',
